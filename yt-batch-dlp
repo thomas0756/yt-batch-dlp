@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+vaapi_device="/dev/dri/renderD128"
+tmp_dl_dir=".dl_tmp"
+
+all_valid=true
+
+list_path=""
+output_path=""
+browser_for_cookies=""
+resolution="1080"
+framerate="60"
+video_codec="h264"
+audio_codec="aac"
+container="mp4"
+
+# ===================
+#    SETUP CLEANUP
+# ===================
+
+cleanup() {
+    trap SIGINT
+    echo "Cleaning up..."
+    if [ -d "$tmp_dl_dir" ]; then
+        rm -r "$tmp_dl_dir"
+    fi
+    rm -f $output_path/*.part
+    echo "Done"
+}
+
+trap cleanup INT
+
+
+# ===================
+#  INPUT VALIDATION
+# ===================
+
+while getopts "f:o:r:b:p:" opt; do
+  case $opt in
+    f)
+        list_path="$OPTARG"
+        list_path_set=true
+        ;;
+    o)
+        output_path="$OPTARG"
+        output_path_set=true
+        ;;
+    r)
+        if [[ "$OPTARG" == *@* ]]; then
+            resolution="${OPTARG%%@*}"
+            framerate="${OPTARG#*@}"
+        else
+            echo "Invalid resolution: must be <height>@<framerate>"
+            all_valid=false
+        fi
+        ;;
+    b)
+        browser_for_cookies="$OPTARG"
+        ;;
+    p)
+        if [[ "$OPTARG" == "legacy" ]]; then
+            video_codec="h264"
+            audio_codec="aac"
+            container="mp4"
+        elif [[ "$OPTARG" == "modern" ]]; then
+            video_codec="av1"
+            audio_codec="libopus"
+            container="webm"
+        else
+            echo "Only h264 and av1 video_codecs are currently supported."
+            all_valid=false
+        fi
+        ;;
+    \?)
+        echo "Invalid option: -$OPTARG"
+        ;;
+    :)
+        echo "Option -$OPTARG requires an argument. Ignoring."
+        ;;
+  esac
+done
+
+if [[ -z "$list_path" ]]; then
+    echo "Missing Option: -f (path to list of URLs) is required."
+    all_valid=false
+elif [[ ! -f "$list_path" ]]; then
+    echo "List file does not exist."
+    all_valid=false
+fi
+
+if [[ -z "$output_path" ]]; then
+    echo "Missing Option: -o (output path) is required."
+    all_valid=false
+fi
+
+
+if [[ "$all_valid" == false ]]; then
+    exit 1
+fi
+
+
+# ===================
+#  SETUP DIRECTORIES
+# ===================
+
+mkdir -p "$output_path"
+mkdir -p "$tmp_dl_dir" # Use temporary downlaod directory since /tmp causes file size issues in some cases
+
+
+# ===================
+#      MAIN LOOP
+# ===================
+
+while IFS= read -r url
+do
+
+# === DOWNLOADING ===
+
+video_name="$(yt-dlp --simulate --print "%(title)s" $url).$container"
+download_to="$tmp_dl_dir/$video_name"
+
+# TODO: refactor this into one yt-dlp command
+if [[ -z "$browser_for_cookies" ]]; then
+    yt-dlp \
+        -f "bestvideo[height<=$resolution]+bestaudio/best[height<=$resolution]" \
+        --merge-output-format $container \
+        -o "$download_to" \
+        "$url"
+else
+    yt-dlp \
+        -f "bestvideo[height<=$resolution]+bestaudio/best[height<=$resolution]" \
+        --merge-output-format $container \
+        --cookies-from-browser "$browser_for_cookies" \
+        -o "$download_to" \
+        "$url"
+fi
+
+# === TRANSCODING ===
+
+transcoded_path="$output_path/$video_name"
+
+# TODO: add support for other render devices (NVIDIA, Intel, CPU)
+ffmpeg \
+    -v warning \
+    -stats \
+    -vaapi_device "$vaapi_device" \
+    -hwaccel vaapi \
+    -hwaccel_output_format vaapi \
+    -i "$download_to" \
+    -vf "scale_vaapi=w=-2:h=$resolution:format=nv12" \
+    -r "$framerate" \
+    -c:v "$video_codec"_vaapi \
+    -f "$container" \
+    -b:v 5M \
+    -maxrate 8M \
+    -bufsize 10M \
+    -c:a "$audio_codec" \
+    -b:a 192k \
+    "$transcoded_path.part" \
+    </dev/null # Stop ffmpeg from messing with stdin
+
+rm "$download_to"
+mv "$transcoded_path.part" "$transcoded_path"
+
+done < "$list_path"
+
+# ===================
+#       CLEANUP
+# ===================
+
+cleanup
